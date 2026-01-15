@@ -1,0 +1,559 @@
+local repo = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
+local Library = loadstring(game:HttpGet(repo .. "Library.lua"))()
+local ThemeManager = loadstring(game:HttpGet(repo .. "addons/ThemeManager.lua"))()
+local SaveManager = loadstring(game:HttpGet(repo .. "addons/SaveManager.lua"))()
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local localPlayer = Players.LocalPlayer
+
+-- --- CONFIG ---
+local Config = {
+    Enabled = false,
+    Method = "1",            
+    TweenSpeed = 55,         
+    KnockbackForce = 6.1,    
+    Timeout = 25,         
+    HipHeightOffset = 4,
+    RayHeight = 100,      
+    RayDepth = 1000,
+    StuckThreshold = 0.5, 
+    StuckCheckTime = 0.5,
+    AvoidPlayers = true,     
+    AvoidRadius = 15,
+    LagbackSensitivity = 10,
+    NormalWalkSpeed = 16,
+    
+    -- FLEE LOGIC
+    AvoidPlayersIdle = false, 
+    IdleHideRadius = 41,      
+    FleeDistance = 200        
+}
+
+-- --- CAVE / BOSS ARENA SETTINGS ---
+local CAVE_AMBER_POS = Vector3.new(1220.64282, -161.975464, 39.2477264)
+local EXIT_TREE_INDEX = 77 
+
+-- --- VARIABLES ---
+local farmingConnection = nil
+local noclipConnection = nil
+local collisionConnection = nil
+local pauseUntil = 0 
+local isIdle = false
+local isExitingCave = false 
+local isFleeing = false
+local lastNotifyTime = 0
+
+-- --- UTILS ---
+local function SafeNotify(msg)
+    if tick() - lastNotifyTime > 2 then
+        Library:Notify(msg)
+        lastNotifyTime = tick()
+    end
+end
+
+local function getRoot(char)
+    return char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("Torso") or char:FindFirstChild("UpperTorso")
+end
+
+local function getHumanoid(char)
+    return char:FindFirstChildWhichIsA("Humanoid")
+end
+
+-- --- CAVE LOGIC ---
+local function isCaveAmber(pos)
+    return (pos - CAVE_AMBER_POS).Magnitude < 5 
+end
+
+local function getCaveExitPosition()
+    local trees = workspace:FindFirstChild("Map Assets") 
+        and workspace["Map Assets"]:FindFirstChild("Trees") 
+        and workspace["Map Assets"].Trees:FindFirstChild("Tall Trees")
+    
+    if trees then
+        local children = trees:GetChildren()
+        local targetTree = children[EXIT_TREE_INDEX]
+        if targetTree then
+            if targetTree:FindFirstChild("Union") then return targetTree.Union.Position
+            elseif targetTree:IsA("Model") then return targetTree:GetPivot().Position
+            elseif targetTree:IsA("BasePart") then return targetTree.Position end
+        end
+    end
+    return CAVE_AMBER_POS + Vector3.new(100, 20, 100) 
+end
+
+local function getAmberPrompts()
+    local itemSpawn = Workspace:FindFirstChild("ItemSpawn")
+    if not itemSpawn then return {} end
+    local amberFolder = itemSpawn:FindFirstChild("Amber")
+    if not amberFolder then return {} end
+    
+    local prompts = {}
+    for _, amber in pairs(amberFolder:GetChildren()) do
+        if amber.Name == "AmberSpawn" then
+            local prompt = amber:FindFirstChildWhichIsA("ProximityPrompt", true)
+            if prompt and prompt.Enabled then
+                table.insert(prompts, prompt)
+            end
+        end
+    end
+    return prompts
+end
+
+local function getPosition(obj)
+    if obj:IsA("BasePart") then return obj.Position end
+    if obj:IsA("Model") then return obj:GetPivot().Position end
+    if obj.Parent:IsA("BasePart") then return obj.Parent.Position end
+    return nil
+end
+
+-- --- MOVEMENT & AVOIDANCE ---
+
+local function getSteeredDirection(currentPos, targetPos)
+    local desiredVelocity = (targetPos - currentPos).Unit
+    if not Config.AvoidPlayers then return Vector3.new(desiredVelocity.X, 0, desiredVelocity.Z).Unit end
+
+    local avoidanceForce = Vector3.zero
+    local count = 0
+    
+    for _, player in pairs(Players:GetPlayers()) do
+        if player ~= localPlayer and player.Character then
+            local otherRoot = getRoot(player.Character)
+            if otherRoot then
+                local offset = currentPos - otherRoot.Position
+                local distance = offset.Magnitude
+                if distance < Config.AvoidRadius and distance > 0.1 then
+                    if desiredVelocity:Dot(offset.Unit * -1) > 0.2 then
+                        local force = offset.Unit * (Config.AvoidRadius / distance)
+                        avoidanceForce = avoidanceForce + force
+                        count = count + 1
+                    end
+                end
+            end
+        end
+    end
+    
+    local finalDir = count > 0 and (desiredVelocity + (avoidanceForce * 1.5)).Unit or desiredVelocity.Unit
+    return Vector3.new(finalDir.X, 0, finalDir.Z).Unit
+end
+
+local function disablePlayerCollisions(enable)
+    if collisionConnection then collisionConnection:Disconnect() collisionConnection = nil end
+    if enable then
+        collisionConnection = RunService.Stepped:Connect(function()
+             if not Config.AvoidPlayers then return end
+             local myChar = localPlayer.Character
+             if not myChar then return end
+             for _, player in pairs(Players:GetPlayers()) do
+                 if player ~= localPlayer and player.Character then
+                     for _, part in pairs(player.Character:GetChildren()) do
+                         if part:IsA("BasePart") and part.CanCollide then
+                             part.CanCollide = false
+                         end
+                     end
+                 end
+             end
+        end)
+    end
+end
+
+local function fireKnockback(directionVector)
+    pcall(function()
+        local requestKnockback = ReplicatedStorage:FindFirstChild("shared/network/init@GlobalEvents")
+        if requestKnockback and requestKnockback:FindFirstChild("requestKnockback") then
+            -- "2 Speed" Logic
+            local thrust = directionVector * math.clamp(Config.KnockbackForce, 0.1, 20)
+            local finalForce = Vector3.new(
+                math.clamp(thrust.X, -10, 10),
+                math.clamp(thrust.Y, -5, 5),   
+                math.clamp(thrust.Z, -10, 10)
+            )
+            firesignal(requestKnockback.requestKnockback.OnClientEvent, 15, 0.6, finalForce)
+        end
+    end)
+end
+
+local function groundPathStep(targetPos, deltaTime)
+    local char = localPlayer.Character
+    if not char then return false end
+    local root = getRoot(char)
+    if not root then return false end
+    local hum = getHumanoid(char)
+    
+    local currentPos = root.Position
+    local distToTarget = (Vector3.new(targetPos.X, 0, targetPos.Z) - Vector3.new(currentPos.X, 0, currentPos.Z)).Magnitude
+    
+    if distToTarget < 5 then return true end 
+    
+    local flatDir = getSteeredDirection(currentPos, targetPos)
+    
+    local currentSpeed = Config.TweenSpeed
+    if Config.Method == "2" then
+        currentSpeed = Config.KnockbackForce * 8 
+    end
+    
+    local moveStep = flatDir * currentSpeed * deltaTime
+    local newPosEstimate = currentPos + moveStep
+    
+    -- Raycasting setup
+    local raycastParams = RaycastParams.new()
+    raycastParams.FilterDescendantsInstances = {char}
+    raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+
+    -- Check Ceiling
+    local ceilingRay = Workspace:Raycast(
+        Vector3.new(newPosEstimate.X, currentPos.Y, newPosEstimate.Z), 
+        Vector3.new(0, 500, 0), 
+        raycastParams
+    )
+
+    local startHeight = Config.RayHeight
+    if ceilingRay then
+        local ceilingHeight = ceilingRay.Position.Y
+        startHeight = (ceilingHeight - currentPos.Y) - 5 
+        if startHeight < 5 then startHeight = 5 end
+    end
+
+    -- Check Ground
+    local rayOrigin = Vector3.new(newPosEstimate.X, currentPos.Y + startHeight, newPosEstimate.Z)
+    local rayDirection = Vector3.new(0, -Config.RayDepth, 0)
+    
+    local rayResult = Workspace:Raycast(rayOrigin, rayDirection, raycastParams)
+    
+    local finalY
+    if rayResult then
+        local hip = (hum and hum.HipHeight > 0) and hum.HipHeight or 2
+        finalY = rayResult.Position.Y + hip + Config.HipHeightOffset
+    else
+        finalY = currentPos.Y 
+    end
+    
+    local finalPos = Vector3.new(newPosEstimate.X, finalY, newPosEstimate.Z)
+    
+    if Config.Method == "1" then
+        -- Method 1
+        root.CFrame = CFrame.lookAt(finalPos, Vector3.new(targetPos.X, finalPos.Y, targetPos.Z))
+        root.Velocity = Vector3.zero 
+        root.RotVelocity = Vector3.zero
+        
+    elseif Config.Method == "2" then
+        -- Method 2
+        root.CFrame = CFrame.lookAt(finalPos, Vector3.new(targetPos.X, finalPos.Y, targetPos.Z))
+        root.Velocity = Vector3.new(0,0,0)
+        root.RotVelocity = Vector3.zero
+        fireKnockback(flatDir)
+    end
+    
+    return false
+end
+
+local function toggleNoclip(enable)
+    if noclipConnection then noclipConnection:Disconnect() noclipConnection = nil end
+    if enable then
+        noclipConnection = RunService.Stepped:Connect(function()
+            if tick() < pauseUntil then return end 
+            local char = localPlayer.Character
+            if char then
+                for _, part in pairs(char:GetDescendants()) do
+                    if part:IsA("BasePart") and part.CanCollide then
+                        part.CanCollide = false
+                    end
+                end
+            end
+        end)
+    end
+end
+
+-- --- FARM CONTROL ---
+
+local function stopFarm()
+    if farmingConnection then farmingConnection:Disconnect() farmingConnection = nil end
+    toggleNoclip(false)
+    disablePlayerCollisions(false)
+    local char = localPlayer.Character
+    if char and getRoot(char) then 
+        getRoot(char).Velocity = Vector3.zero 
+        getRoot(char).Anchored = false
+    end
+    isExitingCave = false
+    isFleeing = false
+end
+
+local function getNearestPlayer(myPos)
+    local closest = nil
+    local closestDist = 99999
+    
+    for _, p in pairs(Players:GetPlayers()) do
+        if p ~= localPlayer and p.Character then
+            local r = getRoot(p.Character)
+            if r then
+                local d = (r.Position - myPos).Magnitude
+                if d < closestDist then
+                    closestDist = d
+                    closest = r.Position
+                end
+            end
+        end
+    end
+    
+    return closest, closestDist
+end
+
+local function startFarm()
+    if farmingConnection then return end
+    
+    local currentTargetPrompt = nil
+    
+    local lastCheckTime = tick()
+    local lastCheckPos = Vector3.new(0,0,0)
+    local lastDistToTarget = 999999
+    
+    isExitingCave = false 
+    isFleeing = false
+    
+    farmingConnection = RunService.Heartbeat:Connect(function(deltaTime)
+        if not Config.Enabled then stopFarm() return end
+        if tick() < pauseUntil then return end 
+        
+        local char = localPlayer.Character
+        local root = getRoot(char)
+        local hum = getHumanoid(char)
+        
+        if not char or not root or not hum or hum.Health <= 0 then
+            Config.Enabled = false
+            return
+        end
+        
+        local currentTargetPos = nil
+        
+        -- === PRIORITY 1: PLAYER AVOIDANCE (FLEE) ===
+        local nearestEnemyPos, nearestEnemyDist = getNearestPlayer(root.Position)
+        
+        if Config.AvoidPlayersIdle and nearestEnemyPos and nearestEnemyDist < Config.IdleHideRadius then
+            local dirAway = (root.Position - nearestEnemyPos).Unit
+            dirAway = Vector3.new(dirAway.X, 0, dirAway.Z).Unit 
+            
+            currentTargetPos = root.Position + (dirAway * Config.FleeDistance)
+            
+            if not isFleeing then
+                isFleeing = true
+                SafeNotify("Player Detected! Evading...")
+                currentTargetPrompt = nil 
+                isExitingCave = false
+            end
+            
+            toggleNoclip(true)
+            
+        elseif isFleeing then
+            isFleeing = false
+            SafeNotify("Area Secure. Resuming.")
+            root.Velocity = Vector3.zero
+            currentTargetPos = nil
+            toggleNoclip(true)
+        end
+        
+        -- === PRIORITY 2: CAVE EXIT ===
+        if not isFleeing then
+            if isExitingCave then
+                currentTargetPos = getCaveExitPosition()
+                
+                local distToTree = (root.Position - currentTargetPos).Magnitude
+                if distToTree < 10 then
+                    isExitingCave = false 
+                    SafeNotify("Cave Exited.")
+                    pauseUntil = tick() + 0.5 
+                    return
+                end
+            
+            -- === PRIORITY 3: AMBER FARMING ===
+            else
+                if not currentTargetPrompt or not currentTargetPrompt.Parent then
+                    local prompts = getAmberPrompts()
+                    if #prompts > 0 then
+                        table.sort(prompts, function(a, b)
+                            local pa = getPosition(a.Parent)
+                            local pb = getPosition(b.Parent)
+                            if pa and pb then
+                                return (root.Position - pa).Magnitude < (root.Position - pb).Magnitude
+                            end
+                            return false
+                        end)
+                        currentTargetPrompt = prompts[1]
+                        
+                        isIdle = false
+                        toggleNoclip(true)
+                        disablePlayerCollisions(true)
+                        lastDistToTarget = 999999
+                    else
+                        if not isIdle then
+                            isIdle = true
+                            toggleNoclip(false)
+                            disablePlayerCollisions(false)
+                            hum.WalkSpeed = Config.NormalWalkSpeed
+                        end
+                    end
+                end
+                
+                if currentTargetPrompt and currentTargetPrompt.Parent then
+                    currentTargetPos = getPosition(currentTargetPrompt.Parent)
+                end
+            end
+        end
+        
+        -- === EXECUTE MOVEMENT ===
+        
+        if currentTargetPos then
+            local currentDist = (root.Position - currentTargetPos).Magnitude
+            
+            if not isFleeing and currentDist > (lastDistToTarget + Config.LagbackSensitivity) then
+                SafeNotify("Rubberbanding Detected.")
+                pauseUntil = tick() + 1.5
+                root.Velocity = Vector3.zero
+                lastDistToTarget = 999999 
+                return
+            end
+            
+            if not isFleeing then lastDistToTarget = currentDist end
+            
+            if tick() - lastCheckTime > Config.StuckCheckTime then
+                local distMoved = (root.Position - lastCheckPos).Magnitude
+                if distMoved < Config.StuckThreshold then
+                    if isFleeing then
+                         root.CFrame = root.CFrame * CFrame.new(5, 2, 0)
+                    else
+                         pauseUntil = tick() + 1.0 
+                         root.Velocity = Vector3.zero
+                         if not isExitingCave then currentTargetPrompt = nil end
+                    end
+                end
+                lastCheckPos = root.Position
+                lastCheckTime = tick()
+            end
+            
+            local reached = groundPathStep(currentTargetPos, deltaTime)
+            
+            if reached then
+                if not isFleeing then
+                    root.Velocity = Vector3.zero
+                    root.CFrame = CFrame.new(currentTargetPos + Vector3.new(0,2,0))
+                    
+                    if not isExitingCave and currentTargetPrompt then
+                        fireproximityprompt(currentTargetPrompt)
+                        for i = 1, 3 do
+                            if currentTargetPrompt and currentTargetPrompt.Parent then
+                                fireproximityprompt(currentTargetPrompt)
+                            end
+                            task.wait(0.05)
+                        end
+                        
+                        if isCaveAmber(currentTargetPos) then
+                            SafeNotify("Cave Amber Collected.")
+                            isExitingCave = true
+                            currentTargetPrompt = nil
+                        else
+                            currentTargetPrompt = nil
+                        end
+                    end
+                    lastDistToTarget = 999999
+                end
+            end
+        else
+            if not isIdle and not isFleeing then root.Velocity = Vector3.zero end
+        end
+    end)
+end
+
+-- --- UI ---
+
+local Window = Library:CreateWindow({
+    Title = "COMBO_WICK",
+    Icon = 7734068321,
+    NotifySide = "Right",
+    ShowCustomCursor = true,
+    Size = UDim2.new(0, 500, 0, 450),
+})
+
+local Tabs = {
+    Main = Window:AddTab("Farm Controls", "gem"),
+    Settings = Window:AddTab("Settings", "wrench"),
+}
+
+-- LEFT COLUMN: Control & Speed
+local FarmGroup = Tabs.Main:AddLeftGroupbox("Main Controls")
+FarmGroup:AddToggle("EnableFarm", {
+    Text = "Enable Auto Collect",
+    Default = false,
+    Callback = function(Value)
+        Config.Enabled = Value
+        if Value then
+            startFarm()
+        else
+            stopFarm()
+        end
+    end,
+})
+
+FarmGroup:AddDropdown("Method", {
+    Values = { "1", "2" },
+    Default = "1",
+    Text = "Movement Method",
+    Callback = function(Value)
+        Config.Method = Value
+    end,
+})
+
+local SpeedGroup = Tabs.Main:AddLeftGroupbox("Speed Settings")
+SpeedGroup:AddSlider("TweenSpeedSlider", {
+    Text = "Speed 1 (Method 1)", Default = 55, Min = 20, Max = 100, Rounding = 0,
+    Callback = function(Value) Config.TweenSpeed = Value end,
+})
+
+SpeedGroup:AddSlider("KnockForceSlider", {
+    Text = "Speed 2 (Method 2)", Default = 6.1, Min = 0.1, Max = 6.1, Rounding = 1,
+    Callback = function(Value) Config.KnockbackForce = Value end,
+})
+
+-- RIGHT COLUMN: Safety & Logic
+local SafetyGroup = Tabs.Main:AddRightGroupbox("Safety")
+SafetyGroup:AddToggle("AvoidPlayersIdle", {
+    Text = "Flee from Players",
+    Default = false,
+    Callback = function(Value) Config.AvoidPlayersIdle = Value end,
+})
+SafetyGroup:AddSlider("DetectRad", {
+    Text = "Detection Radius", Default = 41, Min = 10, Max = 100, Rounding = 0,
+    Callback = function(Value) Config.IdleHideRadius = Value end,
+})
+SafetyGroup:AddSlider("FleeDist", {
+    Text = "Run Distance", Default = 200, Min = 50, Max = 300, Rounding = 0,
+    Callback = function(Value) Config.FleeDistance = Value end,
+})
+
+local PathGroup = Tabs.Main:AddRightGroupbox("Advanced Logic")
+PathGroup:AddToggle("AvoidPlayers", {
+    Text = "Smart Avoidance",
+    Default = true,
+    Callback = function(Value) Config.AvoidPlayers = Value end,
+})
+
+PathGroup:AddSlider("LagbackSlider", {
+    Text = "Lagback Threshold", Default = 10, Min = 5, Max = 50, Rounding = 1,
+    Callback = function(Value) Config.LagbackSensitivity = Value end,
+})
+
+local SettingsGroup = Tabs.Settings:AddLeftGroupbox("Configuration")
+SettingsGroup:AddButton("Unload Script", function()
+    Config.Enabled = false
+    stopFarm()
+    Library:Unload()
+end)
+
+ThemeManager:SetLibrary(Library)
+SaveManager:SetLibrary(Library)
+ThemeManager:SetFolder("ComboWick")
+SaveManager:SetFolder("ComboWick")
+
+Library:Notify("COMBO_WICK Ready")
